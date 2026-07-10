@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.1-leyka
+version: 0.2.2-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -997,6 +997,67 @@ def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_image_blocks(body: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert images in the latest user message into Anthropic content blocks so
+    vision-capable Claude models can see them. OpenWebUI sends images as
+    `image_url` parts, usually base64 `data:` URIs. Returns [] if none."""
+    messages = body.get("messages") or []
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        blocks: List[Dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = ((part.get("image_url") or {}).get("url")) or ""
+            if url.startswith("data:"):
+                try:
+                    header, data = url.split(",", 1)
+                    media_type = header.split(";")[0].split(":", 1)[1] or "image/png"
+                except Exception:
+                    continue
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        },
+                    }
+                )
+            elif url.startswith(("http://", "https://")):
+                blocks.append(
+                    {"type": "image", "source": {"type": "url", "url": url}}
+                )
+        return blocks  # only the latest user message
+    return []
+
+
+def _query_input(prompt: str, image_blocks: List[Dict[str, Any]]):
+    """What to pass to ClaudeSDKClient.query(): the plain string when there are no
+    images, else an async iterable yielding one user message whose content is a
+    text block plus the image blocks (Anthropic content-block format)."""
+    if not image_blocks:
+        return prompt
+
+    async def _gen():
+        content: List[Dict[str, Any]] = []
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+        content.extend(image_blocks)
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "parent_tool_use_id": None,
+        }
+
+    return _gen()
+
+
 class Pipe:
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(
@@ -1474,7 +1535,10 @@ class Pipe:
         os.environ.setdefault("IS_SANDBOX", "1")
 
         prompt = _extract_latest_user_prompt(body)
-        if not prompt:
+        # Uploaded images -> Anthropic content blocks (vision). Allow image-only
+        # messages (no text) through.
+        image_blocks = _extract_image_blocks(body)
+        if not prompt and not image_blocks:
             yield "_No user message to send to Claude Code._"
             return
 
@@ -1650,7 +1714,7 @@ class Pipe:
 
         try:
             async with ClaudeSDKClient(options=options) as client:
-                await client.query(prompt)
+                await client.query(_query_input(prompt, image_blocks))
                 async for message in client.receive_response():
                     if isinstance(message, SystemMessage):
                         if message.subtype == "init":

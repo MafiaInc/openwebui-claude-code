@@ -9,6 +9,9 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 >   selectable models (the picked model is used; `MODEL` valve is the fallback).
 > - **Full file-attachment inlining** — files attached to a chat are passed to
 >   Claude whole (not just top RAG chunks), plus generated-artifact surfacing.
+> - **Image input (vision)** — uploaded images are passed to the model as content
+>   blocks, so you can ask Claude about screenshots/photos (image-only messages
+>   work too). Upstream dropped non-text message parts.
 > - **Open WebUI 0.10.2 knowledge-base fix** — KB search queries the shared
 >   `knowledge-bases` collection filtered by `knowledge_base_id` (0.10.2 dropped
 >   per-KB collections) and awaits the now-async `get_user_by_id`; without it
