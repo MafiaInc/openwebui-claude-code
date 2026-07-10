@@ -4,6 +4,18 @@ Run [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)'s agent 
 
 This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. Each chat gets its own isolated workspace directory; agent turns within the same chat resume the same Claude Code session, so context (files, prior tool calls) carries forward.
 
+> **This fork ([MafiaInc](https://github.com/MafiaInc/openwebui-claude-code)) adds:**
+> - **Open WebUI 0.10.2 knowledge-base fix** — KB search now queries the shared
+>   `knowledge-bases` collection filtered by `knowledge_base_id` (0.10.2 stopped
+>   using per-KB collections), and awaits the now-async `get_user_by_id`. Without
+>   this, attached knowledge silently returns nothing.
+> - **Forced KB search** — when a KB is attached, the model is instructed to call
+>   `search_knowledge` before answering, instead of falling back to memory.
+> - **`CLI_PATH` valve** — run the Claude CLI through a wrapper (e.g. an ssh shim
+>   to a separate sandbox host) instead of locally. The wrapper gets
+>   `OWUI_USER_ID` / `OWUI_CHAT_ID` for per-user/per-chat isolation, and only a
+>   minimal env crosses to the CLI (backend secrets are not exposed).
+
 ## Features
 
 - **Full Claude Code agent loop** — Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch (configurable allowlist)

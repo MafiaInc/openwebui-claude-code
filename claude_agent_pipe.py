@@ -2,7 +2,8 @@
 title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
-version: 0.1
+author_url: https://github.com/MafiaInc/openwebui-claude-code
+version: 0.2.0-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -398,7 +399,7 @@ def _build_kb_mcp_server(
         try:
             from open_webui.main import app
             from open_webui.models.users import Users
-            from open_webui.retrieval.utils import query_collection
+            from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
         except Exception as exc:
             return {
                 "content": [
@@ -427,7 +428,7 @@ def _build_kb_mcp_server(
         user_id = (user_dict or {}).get("id")
         if user_id:
             try:
-                user_obj = Users.get_user_by_id(user_id)
+                user_obj = await Users.get_user_by_id(user_id)
             except Exception:
                 pass
 
@@ -451,12 +452,21 @@ def _build_kb_mcp_server(
                 pass
 
         try:
-            results = await query_collection(
-                collection_names=collection_names,
-                queries=[query],
-                embedding_function=_embed,
-                k=top_k,
+            # Open WebUI 0.10.2 keeps all KB chunks in one shared "knowledge-bases"
+            # collection tagged with a knowledge_base_id, not per-KB collections.
+            # Query it with a metadata filter (per-KB isolation preserved).
+            _qemb = (await _embed([query]))[0]
+            _sr = VECTOR_DB_CLIENT.search(
+                collection_name="knowledge-bases",
+                vectors=[_qemb],
+                filter={"knowledge_base_id": {"$in": collection_names}},
+                limit=top_k,
             )
+            results = {
+                "documents": getattr(_sr, "documents", None) or [[]],
+                "metadatas": getattr(_sr, "metadatas", None) or [[]],
+                "distances": getattr(_sr, "distances", None) or [[]],
+            }
         except Exception as exc:
             log.exception("KB search failed")
             return {"content": [{"type": "text", "text": f"Search failed: {exc}"}]}
@@ -973,6 +983,16 @@ class Pipe:
             default=30,
             description="Maximum agent turns per user message. 0 disables the cap.",
         )
+        CLI_PATH: str = Field(
+            default="",
+            description=(
+                "Path to a wrapper that launches the Claude CLI, instead of the "
+                "bundled local `claude`. Set this to e.g. an ssh shim that runs the "
+                "CLI on a separate sandbox host for isolation. The wrapper receives "
+                "OWUI_USER_ID / OWUI_CHAT_ID in its env so it can choose a per-user "
+                "HOME and per-chat workdir. Empty (default) = run locally."
+            ),
+        )
         SETTING_SOURCES: str = Field(
             default="",
             description=(
@@ -1447,6 +1467,41 @@ class Pipe:
                 "type": "preset",
                 "preset": "claude_code",
                 "append": system_prompt,
+            }
+
+        # Force a KB search when a knowledge base is attached: the agent preset
+        # otherwise treats user-fact questions as memory lookups and skips the
+        # (deferred) MCP tool, so attached knowledge looks ignored.
+        if kb_tool_names:
+            _kb_instr = (
+                "IMPORTANT: the user attached a knowledge base. For ANY question "
+                "about the user, their life, people or pets, documents, or "
+                "factual/internal details, you MUST call the search_knowledge tool "
+                "BEFORE answering and BEFORE saying you do not know. Do not rely on "
+                "memory or assumptions. If the knowledge tools are not listed, use "
+                "ToolSearch to load search_knowledge first, then call it."
+            )
+            _sp = options_kwargs.get("system_prompt")
+            if isinstance(_sp, dict):
+                _sp["append"] = (_sp.get("append", "") + "\n" + _kb_instr).strip()
+            else:
+                options_kwargs["system_prompt"] = {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": _kb_instr,
+                }
+
+        # Optionally run the Claude CLI elsewhere (e.g. an ssh shim to a sandbox
+        # host) via the CLI_PATH valve. Pass the OWUI user/chat ids so the wrapper
+        # can pick a per-user HOME + per-chat workdir; only a minimal env crosses
+        # to the CLI process, so backend secrets are not exposed to it.
+        if self.valves.CLI_PATH:
+            options_kwargs["cli_path"] = self.valves.CLI_PATH
+            options_kwargs["env"] = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": "/root",
+                "OWUI_USER_ID": str((__user__ or {}).get("id") or "shared"),
+                "OWUI_CHAT_ID": str(__chat_id__ or "default"),
             }
 
         options = ClaudeAgentOptions(**options_kwargs)
