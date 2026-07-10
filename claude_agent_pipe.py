@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.0-leyka
+version: 0.2.1-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -165,7 +165,7 @@ def _snapshot_artifacts(scan_dirs: List[Path]) -> Dict[str, int]:
     return snapshot
 
 
-def _inline_new_artifacts(
+async def _inline_new_artifacts(
     scan_dirs: List[Path],
     before: Dict[str, int],
     user_id: Optional[str],
@@ -235,7 +235,7 @@ def _inline_new_artifacts(
             continue
 
         try:
-            Files.insert_new_file(
+            _ins = Files.insert_new_file(
                 user_id,
                 FileForm(
                     id=file_id,
@@ -249,6 +249,8 @@ def _inline_new_artifacts(
                     },
                 ),
             )
+            if asyncio.iscoroutine(_ins):  # async in newer OpenWebUI
+                _ins = await _ins
         except Exception as exc:
             log.exception("Artifact DB row failed: %s", path)
             chunks.append(f"\n\n_(Saved but not linkable: {path.name}: {exc})_\n")
@@ -364,6 +366,50 @@ def _knowledge_row_ids(metadata: Optional[Dict[str, Any]]) -> List[str]:
     return ids
 
 
+async def _attached_file_texts(
+    files: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, str]]:
+    """Full extracted text of files attached directly to the chat message
+    (type == "file"), so Claude receives the WHOLE document in-context —
+    matching how normal models get it. Without this, a chat-uploaded file is
+    only reachable via semantic search_knowledge (top-matching chunks), so
+    Claude silently misses the rest. Workspace-Model knowledge *collections*
+    (type == "collection") are left to the agentic KB tools."""
+    out: List[Dict[str, str]] = []
+    if not files:
+        return out
+    try:
+        from open_webui.models.files import Files
+    except Exception:
+        Files = None  # type: ignore
+    seen: Set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in (None, "file"):
+            continue
+        rec = item.get("file") if isinstance(item.get("file"), dict) else {}
+        fid = item.get("id") or rec.get("id")
+        if not fid or str(fid) in seen:
+            continue
+        seen.add(str(fid))
+        # Prefer content already inlined on the __files__ entry; else look it up.
+        content = ((rec.get("data") or {}).get("content")) or ""
+        if not content and Files is not None:
+            try:
+                row = Files.get_file_by_id(str(fid))
+                if asyncio.iscoroutine(row):  # async in newer OpenWebUI
+                    row = await row
+                content = ((row.data or {}).get("content")) if row else ""
+            except Exception:
+                content = ""
+        content = (content or "").strip()
+        if content:
+            name = item.get("name") or rec.get("filename") or str(fid)
+            out.append({"name": str(name), "text": content})
+    return out
+
+
 def _build_kb_mcp_server(
     knowledge: List[Dict[str, str]],
     knowledge_row_ids: Optional[List[str]] = None,
@@ -380,7 +426,7 @@ def _build_kb_mcp_server(
     that OpenWebUI's middleware already filtered by the user's grants.
     """
     if not knowledge:
-        return None, []
+        return None, [], {}
 
     collection_names = [k["id"] for k in knowledge]
     display = ", ".join(k["name"] for k in knowledge)
@@ -543,7 +589,10 @@ def _build_kb_mcp_server(
 
         for kid in kb_ids:
             try:
-                files = Knowledges.get_files_by_id(kid) or []
+                files = Knowledges.get_files_by_id(kid)
+                if asyncio.iscoroutine(files):  # async in newer OpenWebUI
+                    files = await files
+                files = files or []
             except Exception:
                 continue
             for f in files:
@@ -615,6 +664,8 @@ def _build_kb_mcp_server(
 
         try:
             file_obj = Files.get_file_by_id(file_id)
+            if asyncio.iscoroutine(file_obj):  # async in newer OpenWebUI
+                file_obj = await file_obj
         except Exception as exc:
             return {"content": [{"type": "text", "text": f"Lookup failed: {exc}"}]}
         if file_obj is None:
@@ -1012,7 +1063,20 @@ class Pipe:
         self.valves = self.Valves()
 
     def pipes(self) -> List[Dict[str, str]]:
-        return [{"id": "claude-code", "name": "Claude Code"}]
+        return [
+            {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+            {"id": "claude-opus-4-8", "name": "Claude Opus 4.8"},
+        ]
+
+    def _resolve_model(self, body: Dict[str, Any]) -> str:
+        # OpenWebUI sends the picked model as "<function_id>.<pipe_id>"; our
+        # pipe_ids ARE the Claude model ids. Fall back to the MODEL valve if the
+        # request carries something unexpected.
+        raw = str(body.get("model", ""))
+        candidate = raw.split(".")[-1] if "." in raw else raw
+        known = {"claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-8"}
+        return candidate if candidate in known else (self.valves.MODEL or "claude-sonnet-4-6")
 
     async def _run_fast(
         self,
@@ -1128,7 +1192,7 @@ class Pipe:
         MAX_TOOL_ROUNDS = 10
         for _round in range(MAX_TOOL_ROUNDS + 1):
             kwargs: Dict[str, Any] = {
-                "model": self.valves.MODEL,
+                "model": self._resolve_model(body),
                 "max_tokens": 4096,
                 "messages": messages,
             }
@@ -1286,7 +1350,7 @@ class Pipe:
         system_text = "\n\n".join(p for p in system_parts if p.strip())
 
         options_kwargs: Dict[str, Any] = {
-            "model": self.valves.MODEL,
+            "model": self._resolve_model(body),
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": kb_tool_names,
             "setting_sources": _parse_setting_sources(self.valves.SETTING_SOURCES),
@@ -1417,6 +1481,31 @@ class Pipe:
         # Fast path disabled — always run the full agent loop.
         prompt = _strip_mode_prefix(prompt)
 
+        # Inject the full text of directly-attached files so Claude sees the
+        # WHOLE document. Chat uploads are otherwise only reachable via semantic
+        # search_knowledge (fragments), so Claude silently misses parts. The
+        # ~400k char cap keeps us well inside the model's context window.
+        _attached = await _attached_file_texts(__files__)
+        if _attached:
+            _TOTAL_CAP = 400_000
+            _used = 0
+            _blocks: List[str] = []
+            for _a in _attached:
+                _room = _TOTAL_CAP - _used
+                if _room <= 0:
+                    break
+                _txt = _a["text"]
+                _note = ""
+                if len(_txt) > _room:
+                    _txt = _txt[:_room]
+                    _note = "\n[…truncated; use search_knowledge for the rest…]"
+                _used += len(_txt)
+                _blocks.append(
+                    f'<attached_document name="{_a["name"]}">\n{_txt}{_note}\n</attached_document>'
+                )
+            if _blocks:
+                prompt = "\n\n".join(_blocks) + "\n\n" + prompt
+
         chat_id = __chat_id__ or "default"
         workdir = Path(self.valves.WORKDIR_ROOT) / chat_id
         workdir.mkdir(parents=True, exist_ok=True)
@@ -1439,7 +1528,7 @@ class Pipe:
 
         options_kwargs: Dict[str, Any] = {
             "cwd": str(workdir),
-            "model": self.valves.MODEL,
+            "model": self._resolve_model(body),
             "permission_mode": self.valves.PERMISSION_MODE,
             "allowed_tools": allowed_tools,
             # Which filesystem settings to load (user ~/.claude/, project .claude/,
@@ -1666,7 +1755,7 @@ class Pipe:
 
                     if isinstance(message, ResultMessage):
                         await emit_status("Done.", done=True)
-                        for chunk in _inline_new_artifacts(
+                        for chunk in await _inline_new_artifacts(
                             scan_dirs,
                             artifact_snapshot,
                             (__user__ or {}).get("id"),
@@ -1690,3 +1779,4 @@ class Pipe:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
+
