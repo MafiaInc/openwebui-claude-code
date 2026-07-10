@@ -21,6 +21,11 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 >   to a separate sandbox host) instead of locally. The wrapper gets
 >   `OWUI_USER_ID` / `OWUI_CHAT_ID` for per-user/per-chat isolation, and only a
 >   minimal env crosses to the CLI (backend secrets are not exposed).
+> - **Usage footer (`SHOW_USAGE_FOOTER` valve)** — appends a one-line footer to
+>   each reply: cost + duration, per-turn token usage (input / cache-read /
+>   output), and when the 5-hour rate-limit window resets. All of it rides along
+>   with the normal response (`ResultMessage` + any `RateLimitEvent`), so it
+>   costs no extra API calls or tokens. On by default; toggle off to hide.
 
 ## Features
 
@@ -60,6 +65,7 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 | `WORKDIR_ROOT` | `/tmp/claude-agent-pipe` | Root directory for per-chat workspaces. |
 | `MAX_TURNS` | `30` | Max agent turns per user message. `0` disables the cap. |
 | `SETTING_SOURCES` | *(empty)* | Comma-separated filesystem setting sources to load: `user`, `project`, `local`. Empty = none (isolated baseline). See below. |
+| `SHOW_USAGE_FOOTER` | `true` | Append a per-reply footer (cost · duration · token usage · 5-hour reset). Free — rides with the response. Set `false` to hide. |
 
 ## Persistent context via `CLAUDE.md` (`SETTING_SOURCES`)
 

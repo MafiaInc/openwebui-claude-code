@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.2-leyka
+version: 0.2.3-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -958,6 +958,52 @@ def _parse_setting_sources(raw: str) -> List[str]:
     ]
 
 
+def _fmt_reset(reset_ts: Optional[int]) -> str:
+    """Human 'resets in Hh Mm' from a unix timestamp, or '' if unknown/past."""
+    if not reset_ts:
+        return ""
+    remaining = int(reset_ts) - int(time.time())
+    if remaining <= 0:
+        return ""
+    hours, rem = divmod(remaining, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _usage_footer(message: Any, reset_ts: Optional[int]) -> str:
+    """Compact single-line footer: cost · duration · token usage · 5h reset.
+
+    All values ride along with the response (ResultMessage + any RateLimitEvent),
+    so rendering this costs no extra API calls or tokens. Returns '' if there's
+    nothing worth showing.
+    """
+    parts: List[str] = []
+
+    cost = getattr(message, "total_cost_usd", None)
+    if cost is not None:
+        parts.append(f"Cost: ${cost:.4f}")
+    duration = getattr(message, "duration_ms", None)
+    if duration is not None:
+        parts.append(f"{duration}ms")
+
+    usage = getattr(message, "usage", None) or {}
+    if usage:
+        tin = usage.get("input_tokens") or 0
+        tcache = usage.get("cache_read_input_tokens") or 0
+        tout = usage.get("output_tokens") or 0
+        parts.append(f"{tin} in · {tcache} cached · {tout} out")
+
+    reset = _fmt_reset(reset_ts)
+    if reset:
+        parts.append(f"5h resets in {reset}")
+
+    if not parts:
+        return ""
+    return "\n\n_" + " · ".join(parts) + "_\n"
+
+
 def _needs_agent(prompt: str, files: Optional[List[Any]]) -> bool:
     """Route-per-turn heuristic. `/agent` / `/fast` prefixes are explicit
     overrides. Attachments force agent mode (the model should be able to
@@ -1103,6 +1149,16 @@ class Pipe:
                 "CLI on a separate sandbox host for isolation. The wrapper receives "
                 "OWUI_USER_ID / OWUI_CHAT_ID in its env so it can choose a per-user "
                 "HOME and per-chat workdir. Empty (default) = run locally."
+            ),
+        )
+        SHOW_USAGE_FOOTER: bool = Field(
+            default=True,
+            description=(
+                "Append a small footer to each reply showing cost + duration, "
+                "per-turn token usage (input / cache-read / output), and when "
+                "the 5-hour rate-limit window resets. All of this rides along "
+                "with the normal response — it costs no extra API calls or "
+                "tokens. Turn off to hide the footer entirely."
             ),
         )
         SETTING_SOURCES: str = Field(
@@ -1712,10 +1768,25 @@ class Pipe:
             if heartbeat_task is None or heartbeat_task.done():
                 heartbeat_task = asyncio.create_task(_heartbeat())
 
+        # 5-hour rate-limit reset timestamp, captured from any RateLimitEvent that
+        # streams alongside the response (free — no extra call). Detected by name
+        # so an older SDK without the type still works.
+        rate_limit_reset_ts: Optional[int] = None
+
         try:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(_query_input(prompt, image_blocks))
                 async for message in client.receive_response():
+                    if type(message).__name__ == "RateLimitEvent":
+                        _info = getattr(message, "rate_limit_info", None)
+                        _resets = getattr(_info, "resets_at", None)
+                        if _resets:
+                            try:
+                                rate_limit_reset_ts = int(_resets)
+                            except (TypeError, ValueError):
+                                pass
+                        continue
+
                     if isinstance(message, SystemMessage):
                         if message.subtype == "init":
                             session_id = message.data.get("session_id")
@@ -1827,8 +1898,10 @@ class Pipe:
                             yield chunk
                         if message.subtype != "success":
                             yield f"\n\n_Agent stopped: {message.subtype}_\n"
-                        if message.total_cost_usd is not None:
-                            yield f"\n\n_Cost: ${message.total_cost_usd:.4f} · {message.duration_ms}ms_\n"
+                        if self.valves.SHOW_USAGE_FOOTER:
+                            footer = _usage_footer(message, rate_limit_reset_ts)
+                            if footer:
+                                yield footer
                         return
 
         except Exception as exc:
