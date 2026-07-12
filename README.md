@@ -21,6 +21,14 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 >   to a separate sandbox host) instead of locally. The wrapper gets
 >   `OWUI_USER_ID` / `OWUI_CHAT_ID` for per-user/per-chat isolation, and only a
 >   minimal env crosses to the CLI (backend secrets are not exposed).
+> - **History replay across restarts** — session continuity normally relies on
+>   an in-process `chat_id → session_id` map, which is lost whenever the backend
+>   process restarts (deploy, reboot, crash). Upstream then silently sends only
+>   the newest message, so reopening an old chat loses all prior context. This
+>   fork detects the missing session and replays the conversation OpenWebUI
+>   already persisted (`body["messages"]`, minus our rendered tool/footer
+>   chrome), so the thread survives restarts. Warm follow-ups still `resume` and
+>   pay nothing extra.
 > - **Usage footer (`SHOW_USAGE_FOOTER` valve)** — appends a one-line footer to
 >   each reply: cost + duration, per-turn token usage (input / cache-read /
 >   output), and when the 5-hour rate-limit window resets. All of it rides along

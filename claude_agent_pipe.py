@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.3-leyka
+version: 0.2.4-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -1043,6 +1043,69 @@ def _extract_latest_user_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 
+def _message_text(content: Any) -> str:
+    """Plain text from an OpenWebUI message `content` (str, or list of parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(t for t in texts if t)
+    return ""
+
+
+# Scaffolding we render into assistant replies (collapsible tool/thinking blocks
+# and the usage footer). Strip it when replaying history so we feed Claude the
+# actual answer, not our UI chrome — and to save tokens.
+_HISTORY_DETAILS_RE = re.compile(r"<details>.*?</details>\s*", re.DOTALL)
+_HISTORY_FOOTER_RE = re.compile(r"\n*_(?:Cost:|Agent stopped:)[^\n]*_\s*$")
+
+
+def _clean_assistant_text(text: str) -> str:
+    text = _HISTORY_DETAILS_RE.sub("", text)
+    text = _HISTORY_FOOTER_RE.sub("", text)
+    return text.strip()
+
+
+def _build_history_prefix(body: Dict[str, Any]) -> str:
+    """Render prior turns as a plain-text transcript, EXCLUDING the current
+    (latest) user message which is sent separately.
+
+    Used to restore context when there is no live Claude Code session to resume
+    (backend restarted, or an old chat reopened). OpenWebUI always sends the full
+    conversation in `body["messages"]`, so this reconstructs what the resumed
+    session would have carried. Returns '' when there is no prior turn.
+    """
+    messages = body.get("messages") or []
+    last_user = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user = i
+            break
+    lines: List[str] = []
+    for msg in messages[: last_user if last_user >= 0 else len(messages)]:
+        role = msg.get("role")
+        if role == "user":
+            text = _message_text(msg.get("content")).strip()
+            if text:
+                lines.append(f"User: {text}")
+        elif role == "assistant":
+            text = _clean_assistant_text(_message_text(msg.get("content")))
+            if text:
+                lines.append(f"Assistant: {text}")
+    if not lines:
+        return ""
+    return (
+        "For context, here is our earlier conversation in this chat "
+        "(there is no live session to resume, so it is replayed here):\n\n"
+        + "\n\n".join(lines)
+        + "\n\n---\n\nContinuing from the above, my new message is:\n\n"
+    )
+
+
 def _extract_image_blocks(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Convert images in the latest user message into Anthropic content blocks so
     vision-capable Claude models can see them. OpenWebUI sends images as
@@ -1634,6 +1697,15 @@ class Pipe:
             t.strip() for t in self.valves.ALLOWED_TOOLS.split(",") if t.strip()
         ]
         resume_id = _chat_sessions.get(chat_id)
+
+        # No live session to resume (backend restarted, or an old chat reopened):
+        # the SDK would otherwise see only this one message and lose all prior
+        # context. Replay the conversation OpenWebUI persisted so Claude keeps the
+        # thread. Warm follow-ups (resume_id set) skip this and stay cheap.
+        if not resume_id:
+            history_prefix = _build_history_prefix(body)
+            if history_prefix:
+                prompt = history_prefix + prompt
 
         # Knowledge base attached via Workspace Model → expose as an MCP tool
         # Claude can call agentically. OpenWebUI's middleware already added one
