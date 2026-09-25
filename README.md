@@ -12,11 +12,16 @@ This is an Open WebUI **Pipe** that exposes Claude Code as a selectable model. E
 > - **Image input (vision)** — uploaded images are passed to the model as content
 >   blocks, so you can ask Claude about screenshots/photos (image-only messages
 >   work too). Upstream dropped non-text message parts.
-> - **Open WebUI 0.10.2 knowledge-base fix** — KB search queries the shared
->   `knowledge-bases` collection filtered by `knowledge_base_id` (0.10.2 dropped
->   per-KB collections) and awaits the now-async `get_user_by_id`; without it
->   attached knowledge silently returns nothing. When a KB is attached the model
->   is also instructed to actually call `search_knowledge`.
+> - **Knowledge-base search fix** — KB search calls Open WebUI's own
+>   `query_collection` (the same helper native chat RAG uses) instead of
+>   querying a vector collection by hand, so it stays correct across Open
+>   WebUI's own schema changes (this repo previously hand-rolled a query
+>   against a shared `knowledge-bases` collection, which matched Open WebUI
+>   0.10.2's storage but silently returned nothing once later builds moved to
+>   one collection per knowledge base) — and awaits the now-async
+>   `get_user_by_id`. Without either, attached knowledge silently returns
+>   nothing. When a KB is attached the model is also instructed to actually
+>   call `search_knowledge`.
 > - **`CLI_PATH` valve** — run the Claude CLI through a wrapper (e.g. an ssh shim
 >   to a separate sandbox host) instead of locally. The wrapper gets
 >   `OWUI_USER_ID` / `OWUI_CHAT_ID` for per-user/per-chat isolation, and only a

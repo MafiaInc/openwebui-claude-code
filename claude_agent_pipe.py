@@ -445,7 +445,7 @@ def _build_kb_mcp_server(
         try:
             from open_webui.main import app
             from open_webui.models.users import Users
-            from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+            from open_webui.retrieval.utils import query_collection
         except Exception as exc:
             return {
                 "content": [
@@ -498,21 +498,28 @@ def _build_kb_mcp_server(
                 pass
 
         try:
-            # Open WebUI 0.10.2 keeps all KB chunks in one shared "knowledge-bases"
-            # collection tagged with a knowledge_base_id, not per-KB collections.
-            # Query it with a metadata filter (per-KB isolation preserved).
-            _qemb = (await _embed([query]))[0]
-            _sr = VECTOR_DB_CLIENT.search(
-                collection_name="knowledge-bases",
-                vectors=[_qemb],
-                filter={"knowledge_base_id": {"$in": collection_names}},
-                limit=top_k,
+            # Each knowledge base's chunks live in their own collection, named
+            # for the KB's own id -- confirmed against a live instance's logs
+            # ("added N items to collection <kb_id>"). This used to instead
+            # query a single shared "knowledge-bases" collection with a
+            # knowledge_base_id metadata filter, which was OpenWebUI's 0.10.2
+            # scheme; that collection no longer exists/gets populated on
+            # current (rolling ghcr.io/open-webui/open-webui:main) builds, so
+            # every search silently returned zero results. query_collection is
+            # OpenWebUI's own canonical multi-collection retrieval helper (same
+            # one native chat RAG uses) -- it queries each collection_name
+            # directly, degrades a missing/empty collection to no results
+            # instead of raising, and also picks up hybrid search/reranking
+            # when the admin has that enabled (skipped here since no `request`
+            # is available in this context -- same plain-vector behavior as
+            # before, just against the right collections).
+            results = await query_collection(
+                request=None,
+                collection_names=collection_names,
+                queries=[query],
+                embedding_function=_embed,
+                k=top_k,
             )
-            results = {
-                "documents": getattr(_sr, "documents", None) or [[]],
-                "metadatas": getattr(_sr, "metadatas", None) or [[]],
-                "distances": getattr(_sr, "distances", None) or [[]],
-            }
         except Exception as exc:
             log.exception("KB search failed")
             return {"content": [{"type": "text", "text": f"Search failed: {exc}"}]}
