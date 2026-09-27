@@ -3,13 +3,12 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.6-leyka
+version: 0.2.8-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
 
 import asyncio
-import json
 import logging
 import mimetypes
 import os
@@ -91,53 +90,6 @@ def _tool_preview(name: str, tool_input: Dict[str, Any]) -> str:
     first = raw.split("\n", 1)[0]
     truncated = first if len(first) <= 120 else first[:117] + "…"
     return truncated + (" …" if "\n" in raw and not truncated.endswith("…") else "")
-
-
-_FENCE_LANG_PER_TOOL = {
-    "Bash": "bash",
-    "Glob": "text",
-    "Grep": "text",
-    "WebSearch": "text",
-    "WebFetch": "text",
-}
-
-
-def _tool_input_block(name: str, tool_input: Dict[str, Any]) -> str:
-    """Full tool invocation as fenced code block(s). If the tool has a known
-    primary field (Bash→command, Read→file_path, …), render that with the
-    right syntax highlight and append any other fields as a small JSON block.
-    Tools with no known primary render as a single JSON block.
-    """
-    if not tool_input:
-        return "```\n(no input)\n```"
-    primary = _TOOL_PREVIEW_FIELDS.get(name)
-    if primary and primary in tool_input:
-        lang = _FENCE_LANG_PER_TOOL.get(name, "text")
-        parts = [f"```{lang}\n{tool_input[primary]}\n```"]
-        others = {k: v for k, v in tool_input.items() if k != primary}
-        if others:
-            parts.append(
-                f"```json\n{json.dumps(others, indent=2, ensure_ascii=False)}\n```"
-            )
-        return "\n\n".join(parts)
-    return f"```json\n{json.dumps(tool_input, indent=2, ensure_ascii=False)}\n```"
-
-
-def _format_tool_result(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                parts.append(text if isinstance(text, str) else repr(item))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts)
-    return str(content)
 
 
 def _iter_artifact_files(scan_dirs: List[Path]) -> "list[Path]":
@@ -1064,8 +1016,9 @@ def _message_text(content: Any) -> str:
     return ""
 
 
-# Scaffolding we render into assistant replies (collapsible tool/thinking blocks
-# and the usage footer). Strip it when replaying history so we feed Claude the
+# Legacy scaffolding (older replies still have collapsible tool/thinking
+# <details> blocks in history — pre-dates dropping them from new replies) plus
+# the usage footer. Strip both when replaying history so we feed Claude the
 # actual answer, not our UI chrome — and to save tokens.
 _HISTORY_DETAILS_RE = re.compile(r"<details>.*?</details>\s*", re.DOTALL)
 _HISTORY_FOOTER_RE = re.compile(r"\n*_(?:Cost:|Agent stopped:)[^\n]*_\s*$")
@@ -1440,15 +1393,6 @@ class Pipe:
                         )
                     except Exception:
                         pass
-                # Render a compact tool-use note so the user can see what
-                # Claude searched for.
-                summary = f"🔧 {block.name}" + (f" · {preview}" if preview else "")
-                yield (
-                    "\n\n<details>\n"
-                    f"<summary>{summary}</summary>\n\n"
-                    f"{_tool_input_block(block.name, block.input or {})}\n\n"
-                    "</details>\n\n"
-                )
                 text = await _dispatch_kb_tool(
                     block.name, block.input or {}, kb_tools_by_name
                 )
@@ -1587,32 +1531,32 @@ class Pipe:
                                     thinking_buffers[idx] += delta.get("thinking", "")
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
-                            if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n"
-                                        "<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                            thinking_buffers.pop(idx, None)
                     elif isinstance(message, AssistantMessage):
-                        # Tool-use rendering (KB tools only here).
+                        # Tool-use status (KB tools only here). Kept out of the
+                        # message text — anything yielded here ends up in
+                        # OpenWebUI's message.output, which its TTS reads
+                        # verbatim with no <details> stripping.
                         for block in message.content:
                             if isinstance(block, ToolUseBlock):
                                 preview = _tool_preview(block.name, block.input)
-                                summary = f"🔧 {block.name}" + (
-                                    f" · {preview}" if preview else ""
-                                )
-                                yield (
-                                    "\n\n<details>\n"
-                                    f"<summary>{summary}</summary>\n\n"
-                                    f"{_tool_input_block(block.name, block.input)}\n\n"
-                                    "</details>\n\n"
-                                )
+                                if event_emitter:
+                                    try:
+                                        await event_emitter(
+                                            {
+                                                "type": "status",
+                                                "data": {
+                                                    "description": f"🔧 {block.name}"
+                                                    + (f": {preview}" if preview else ""),
+                                                    "done": False,
+                                                },
+                                            }
+                                        )
+                                    except Exception:
+                                        pass
                     elif isinstance(message, UserMessage):
-                        # Surface tool errors (quietly) so the user isn't
-                        # confused by Claude retrying silently.
+                        # Surface tool errors (quietly) as a status update so
+                        # the user isn't confused by Claude retrying silently.
                         content = message.content
                         if isinstance(content, list):
                             for block in content:
@@ -1620,13 +1564,19 @@ class Pipe:
                                     isinstance(block, ToolResultBlock)
                                     and block.is_error
                                 ):
-                                    err_text = _format_tool_result(block.content)[:400]
-                                    yield (
-                                        "\n\n<details>\n<summary>"
-                                        "<sub>⚙️ tool hiccup</sub></summary>\n\n"
-                                        f"```\n{err_text}\n```\n\n"
-                                        "</details>\n\n"
-                                    )
+                                    if event_emitter:
+                                        try:
+                                            await event_emitter(
+                                                {
+                                                    "type": "status",
+                                                    "data": {
+                                                        "description": "⚙️ tool hiccup, retrying…",
+                                                        "done": False,
+                                                    },
+                                                }
+                                            )
+                                        except Exception:
+                                            pass
                     elif isinstance(message, ResultMessage):
                         return
         except Exception as exc:
@@ -1808,12 +1758,13 @@ class Pipe:
         scan_dirs = [workdir, Path("/tmp")]
         artifact_snapshot = _snapshot_artifacts(scan_dirs)
 
-        # Buffer thinking deltas and emit the <details>…</details> wrapper as
-        # one atomic chunk at content_block_stop. Streaming the opener+content
-        # token-by-token is unreliable: CommonMark's HTML block terminates at
-        # blank lines, so thinking text with paragraph breaks strands the
-        # opening <details><summary> as literal text in some renderers. Reset
-        # at each message_start (indices restart per assistant message).
+        # Buffer thinking deltas so a completed chunk can be discarded as a
+        # whole. Never yield thinking text into the message itself — it would
+        # land in OpenWebUI's message.output, which its TTS reads verbatim
+        # with no <details>-stripping (unlike the legacy message.content
+        # path), so anything here gets read aloud on kid-facing models. The
+        # emit_status() calls below are the only user-visible surface for
+        # this. Reset at each message_start (indices restart per message).
         thinking_buffers: Dict[int, str] = {}
 
         # Heartbeat: when a tool starts, emit a status update every 5s showing
@@ -1896,14 +1847,7 @@ class Pipe:
                             # is rendered once fully from AssistantMessage below.
                         elif etype == "content_block_stop":
                             idx = ev.get("index", 0)
-                            if idx in thinking_buffers:
-                                text = thinking_buffers.pop(idx).strip()
-                                if text:
-                                    yield (
-                                        "\n\n<details>\n<summary>💭 Thinking</summary>\n\n"
-                                        f"{text}\n\n"
-                                        "</details>\n\n"
-                                    )
+                            thinking_buffers.pop(idx, None)
                         continue
 
                     if isinstance(message, AssistantMessage):
@@ -1924,25 +1868,6 @@ class Pipe:
                                     "started": time.monotonic(),
                                 }
                                 _ensure_heartbeat()
-                                # Render as a collapsed <details>: summary is
-                                # plain text (OpenWebUI's sanitizer strips
-                                # inline HTML like <strong>/<code> inside
-                                # <summary> and renders the tags as literal
-                                # text); expanding reveals the full tool
-                                # input as a language-tagged fenced code block.
-                                # Don't html.escape here — OpenWebUI escapes
-                                # <summary> content itself, so pre-escaping
-                                # would double-encode ("&lt;" → "&amp;lt;").
-                                summary_text = f"🔧 {block.name}" + (
-                                    f" · {preview}" if preview else ""
-                                )
-                                body = _tool_input_block(block.name, block.input)
-                                yield (
-                                    "\n\n<details>\n"
-                                    f"<summary>{summary_text}</summary>\n\n"
-                                    f"{body}\n\n"
-                                    "</details>\n\n"
-                                )
                         continue
 
                     if isinstance(message, UserMessage):
@@ -1954,17 +1879,9 @@ class Pipe:
                                 active_tools.pop(block.tool_use_id, None)
                                 if block.is_error:
                                     # Tool errors are usually transient — Claude
-                                    # retries and recovers. Render as a quiet,
-                                    # collapsed detail so the red icon / big
-                                    # traceback doesn't alarm users.
-                                    err_text = _format_tool_result(block.content)[:800]
-                                    yield (
-                                        "\n\n<details>\n<summary>"
-                                        "<sub>⚙️ tool hiccup (retrying)</sub>"
-                                        "</summary>\n\n"
-                                        f"```\n{err_text}\n```\n\n"
-                                        "</details>\n\n"
-                                    )
+                                    # retries and recovers. Surface as a quiet
+                                    # status update, not message text.
+                                    await emit_status("⚙️ tool hiccup, retrying…")
                         continue
 
                     if isinstance(message, ResultMessage):
