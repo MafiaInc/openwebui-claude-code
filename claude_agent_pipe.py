@@ -45,6 +45,7 @@ _MAX_ARTIFACT_BYTES = 50 * 1024 * 1024  # 50 MiB
 
 from claude_agent_sdk import (
     AssistantMessage,
+    CLIJSONDecodeError,
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
@@ -1174,6 +1175,18 @@ class Pipe:
                 "HOME and per-chat workdir. Empty (default) = run locally."
             ),
         )
+        MAX_BUFFER_SIZE_MB: int = Field(
+            default=10,
+            description=(
+                "Max size (MB) of a single stream-json line the SDK will parse "
+                "from the CLI subprocess's stdout. The SDK's own default is 1 MiB, "
+                "which a single MCP tool result containing a full-page image "
+                "(base64-encoded) can exceed — that raised CLIJSONDecodeError mid-"
+                "turn for real users. Raised here as a safety margin; MCP tools "
+                "that return images should also keep their payloads well under "
+                "this on their own."
+            ),
+        )
         SHOW_USAGE_FOOTER: bool = Field(
             default=True,
             description=(
@@ -1487,6 +1500,7 @@ class Pipe:
             "setting_sources": _parse_setting_sources(self.valves.SETTING_SOURCES),
             "system_prompt": system_text,
             "include_partial_messages": True,
+            "max_buffer_size": self.valves.MAX_BUFFER_SIZE_MB * 1024 * 1024,
         }
         if kb_server is not None:
             options_kwargs["mcp_servers"] = {"helm-kb": kb_server}
@@ -1579,6 +1593,13 @@ class Pipe:
                                             pass
                     elif isinstance(message, ResultMessage):
                         return
+        except CLIJSONDecodeError as exc:
+            log.exception("Lite-agent fast path failed: CLI output exceeded buffer")
+            yield (
+                "\n\n_Sorry, that reply included more data than I could handle in "
+                "one go. Please ask again — it usually goes through fine on a "
+                "retry._\n"
+            )
         except Exception as exc:
             log.exception("Lite-agent fast path failed")
             yield f"\n\n**Fast-path error:** `{type(exc).__name__}: {exc}`\n"
@@ -1688,6 +1709,11 @@ class Pipe:
             # Stream token-level deltas so long answers type out instead of
             # appearing as one chunk when the block finishes.
             "include_partial_messages": True,
+            # See MAX_BUFFER_SIZE_MB's docstring — the SDK's 1 MiB default per
+            # stream-json line is smaller than a single image-bearing MCP tool
+            # result (e.g. eprosveta-mcp/klett-mcp's get_page_image), which
+            # raised CLIJSONDecodeError mid-turn for real users.
+            "max_buffer_size": self.valves.MAX_BUFFER_SIZE_MB * 1024 * 1024,
         }
         if resume_id:
             options_kwargs["resume"] = resume_id
@@ -1900,6 +1926,20 @@ class Pipe:
                                 yield footer
                         return
 
+        except CLIJSONDecodeError as exc:
+            # A single stream-json line from the CLI (typically an MCP tool
+            # result carrying a base64 image) exceeded max_buffer_size. Full
+            # detail goes to the log only — the raw exception text used to be
+            # yielded straight into the chat mid-turn, which is confusing
+            # (and alarming) for a non-technical end user to see appear in
+            # the middle of an otherwise normal-looking reply.
+            log.exception("Claude Agent SDK pipe failed: CLI output exceeded buffer")
+            await emit_status("Response too large to process.", done=True)
+            yield (
+                "\n\n_Sorry, that reply included more data than I could handle in "
+                "one go (likely a large image). Please ask again — it usually goes "
+                "through fine on a retry._\n"
+            )
         except Exception as exc:
             log.exception("Claude Agent SDK pipe failed")
             await emit_status(f"Error: {exc}", done=True)
