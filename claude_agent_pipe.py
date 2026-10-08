@@ -3,7 +3,7 @@ title: Claude Code
 description: Run Claude Code's agent loop from inside OpenWebUI chats via the Claude Agent SDK.
 author: Thomas Friedel
 author_url: https://github.com/MafiaInc/openwebui-claude-code
-version: 0.2.8-leyka
+version: 0.2.10-leyka
 license: MIT
 requirements: claude-agent-sdk>=0.1.60, anthropic>=0.40.0
 """
@@ -1147,7 +1147,7 @@ class Pipe:
         )
         MODEL: str = Field(
             default="claude-haiku-4-5",
-            description="Claude model ID (e.g. claude-haiku-4-5, claude-sonnet-5, claude-opus-5).",
+            description="Claude model ID (e.g. claude-haiku-4-5, claude-sonnet-5-5, claude-opus-5-5).",
         )
         PERMISSION_MODE: str = Field(
             default="bypassPermissions",
@@ -1218,18 +1218,23 @@ class Pipe:
     def pipes(self) -> List[Dict[str, str]]:
         return [
             {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5"},
-            {"id": "claude-sonnet-5", "name": "Claude Sonnet 5"},
-            {"id": "claude-opus-5", "name": "Claude Opus 5"},
+            {"id": "claude-sonnet-5-5", "name": "Claude Sonnet 5.5"},
+            {"id": "claude-opus-5-5", "name": "Claude Opus 5.5"},
         ]
 
     def _resolve_model(self, body: Dict[str, Any]) -> str:
         # OpenWebUI sends the picked model as "<function_id>.<pipe_id>"; our
         # pipe_ids ARE the Claude model ids. Fall back to the MODEL valve if the
-        # request carries something unexpected.
+        # request carries something unexpected. Retired ids from older picker
+        # entries map to their successors so existing chats keep working.
         raw = str(body.get("model", ""))
         candidate = raw.split(".")[-1] if "." in raw else raw
-        known = {"claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"}
-        return candidate if candidate in known else (self.valves.MODEL or "claude-sonnet-5")
+        candidate = {
+            "claude-sonnet-5": "claude-sonnet-5-5",
+            "claude-opus-5": "claude-opus-5-5",
+        }.get(candidate, candidate)
+        known = {"claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"}
+        return candidate if candidate in known else (self.valves.MODEL or "claude-sonnet-5-5")
 
     async def _run_fast(
         self,
